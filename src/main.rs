@@ -4,6 +4,7 @@ use winit::{
     event::WindowEvent,
     event_loop::{ActiveEventLoop, EventLoop},
     window::{Window, WindowId},
+    keyboard::{KeyCode}
 };
 
 mod state;
@@ -39,8 +40,8 @@ impl ApplicationHandler for App {
             event_loop
                 .create_window(
                     Window::default_attributes()
-                        .with_title("wgpu template")
-                        .with_inner_size(winit::dpi::LogicalSize::new(800, 600)),
+                        .with_title("Voxel AI Simulation")
+                        .with_inner_size(winit::dpi::LogicalSize::new(1440, 810)),
                 )
                 .expect("failed to create window"),
         );
@@ -71,8 +72,14 @@ impl ApplicationHandler for App {
             }
 
             // Keyboard inputs
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput {event, ..} => {
                 if let winit::keyboard::PhysicalKey::Code(keycode) = event.physical_key {
+                    if keycode == KeyCode::Escape && event.state.is_pressed() {
+                        if let (Some(state), Some(window)) = (self.state.as_mut(), self.window.as_ref()) {
+                            state.set_mouse_grab(window, false);
+                        }
+                    }
+
                     if let Some(state) = self.state.as_mut() {
                         state.process_input(&keycode, event.state.is_pressed());
                     }
@@ -84,6 +91,14 @@ impl ApplicationHandler for App {
                 state.resize(new_size);
                 window.request_redraw();
             }
+
+            // Mouse grabbing
+            WindowEvent::MouseInput {state: winit::event::ElementState::Pressed, ..} => {
+                if let (Some(state), Some(window)) = (self.state.as_mut(), self.window.as_ref()) {
+                    state.set_mouse_grab(window, true);
+                }
+            }
+
 
             // Per frame drawing
             WindowEvent::RedrawRequested => {
@@ -123,6 +138,14 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _device_id: winit::event::DeviceId, event: winit::event::DeviceEvent) {
+        if let winit::event::DeviceEvent::MouseMotion {delta} = event {
+            if let Some(state) = self.state.as_mut() {
+                state.process_mouse(delta.0 as f32, delta.1 as f32);
+            }
+        }
+    }
 }
 
 
@@ -130,13 +153,13 @@ impl ApplicationHandler for App {
 fn main() {
     env_logger::builder()
         .filter_level(log::LevelFilter::Warn)
-        .filter_module("wgpu_template", log::LevelFilter::Info)
+        .filter_module("Voxel AI Simulation", log::LevelFilter::Info)
         .init();
 
-    let event_loop = EventLoop::new().expect("failed to create event loop");
+    let event_loop = EventLoop::new().expect("Failed to create event loop");
     let mut app = App::new();
 
     event_loop
         .run_app(&mut app)
-        .expect("event loop exited with error");
+        .expect("Event loop exited with error");
 }
