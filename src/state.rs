@@ -17,11 +17,17 @@ use crate::worldgen;
 use worldgen::{BlockType, WorldGen};
 
 
-pub const CHUNK_SIZE: i32 = 32;
-pub const RENDER_DISTANCE: i32 = 2;
-pub const Y_DIST: IVec2 = IVec2::new(-2, 4);
+pub const CHUNK_SIZE: i32 = 16;
+pub const Y_DIST: IVec2 = IVec2::new(-6, 6);
+pub const RENDER_DISTANCE: i32 = 8;
 pub const WORLD_SEED: i32 = 1337;
 pub const CHUNK_THREADS: i16 = 8;
+
+pub const PADDED_SIZE: usize = (CHUNK_SIZE + 2) as usize;
+
+const EST_VERTS_PER_CHUNK: usize = 10000;
+const EST_INDICES_PER_CHUNK: usize = 15000;
+const MAX_CHUNKS: usize = ((RENDER_DISTANCE * 2 + 2).pow(3)) as usize;
 
 
 // Vertex uniform
@@ -30,7 +36,7 @@ pub const CHUNK_THREADS: i16 = 8;
 pub struct Vertex {
     position: [f32; 3],
     normal: [f32; 3],
-    color: [f32; 3],
+    color: [f32; 3]
 }
 
 impl Vertex {
@@ -49,13 +55,13 @@ impl Vertex {
                 },
                 // location 1 = normal
                 wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    offset: 12,
                     shader_location: 1,
                     format: wgpu::VertexFormat::Float32x3,
                 },
                 // location 2 = color
                 wgpu::VertexAttribute {
-                    offset: (std::mem::size_of::<[f32; 3]>() * 2) as wgpu::BufferAddress,
+                    offset: 24,
                     shader_location: 2,
                     format: wgpu::VertexFormat::Float32x3,
                 }
@@ -83,7 +89,7 @@ impl CameraUniform {
 
 // Chunk uniform
 pub struct Chunk {
-    pub blocks: Box<[[[BlockType; CHUNK_SIZE as usize]; CHUNK_SIZE as usize]; CHUNK_SIZE as usize]>,
+    pub blocks: Box<[[[BlockType; PADDED_SIZE]; PADDED_SIZE]; PADDED_SIZE]>,
 
     // In chunk coords
     pub position: glam::IVec3,
@@ -98,7 +104,7 @@ pub struct Chunk {
 impl Chunk {
     pub fn new(position: glam::IVec3) -> Self {
         Self {
-            blocks: Box::new([[[BlockType::Air; CHUNK_SIZE as usize]; CHUNK_SIZE as usize]; CHUNK_SIZE as usize]),
+            blocks: Box::new([[[BlockType::Air; PADDED_SIZE]; PADDED_SIZE]; PADDED_SIZE]),
             position,
             vertices: Vec::new(),
             indices: Vec::new(),
@@ -107,7 +113,7 @@ impl Chunk {
     }
 
     pub fn set_block(&mut self, x: usize, y: usize, z: usize, block: BlockType) {
-        self.blocks[x][y][z] = block;
+        self.blocks[x + 1][y + 1][z + 1] = block; // Offset for padding
         self.dirty = true;
     }
 
@@ -137,7 +143,7 @@ impl Chunk {
         }
     }
 
-    pub fn rebuild_mesh(&mut self, chunks: &HashMap<glam::IVec3, Chunk>) {
+    pub fn rebuild_mesh(&mut self) {
         self.vertices.clear();
         self.indices.clear();
 
@@ -147,31 +153,33 @@ impl Chunk {
             (self.position.z * CHUNK_SIZE) as f32,
         );
 
-        for x in 0..CHUNK_SIZE {
-            for y in 0..CHUNK_SIZE {
-                for z in 0..CHUNK_SIZE {
-                    if self.blocks[x as usize][y as usize][z as usize] == BlockType::Air {
+        // Ignore padded outsides
+        for x in 1..=CHUNK_SIZE as usize {
+            for y in 1..=CHUNK_SIZE as usize {
+                for z in 1..=CHUNK_SIZE as usize {
+                    if self.blocks[x][y][z] == BlockType::Air {
                         continue;
                     }
 
-                    let world_pos = chunk_world + glam::Vec3::new(x as f32, y as f32, z as f32);
+                    let world_pos = chunk_world
+                        + glam::Vec3::new((x - 1) as f32, (y - 1) as f32, (z - 1) as f32);
 
-                    if self.get_block(x + 1, y, z, chunks) == BlockType::Air {
+                    if self.blocks[x + 1][y][z] == BlockType::Air {
                         add_face(&mut self.vertices, &mut self.indices, world_pos, Face::Right);
                     }
-                    if self.get_block(x - 1, y, z, chunks) == BlockType::Air {
+                    if self.blocks[x - 1][y][z] == BlockType::Air {
                         add_face(&mut self.vertices, &mut self.indices, world_pos, Face::Left);
                     }
-                    if self.get_block(x, y + 1, z, chunks) == BlockType::Air {
+                    if self.blocks[x][y + 1][z] == BlockType::Air {
                         add_face(&mut self.vertices, &mut self.indices, world_pos, Face::Top);
                     }
-                    if self.get_block(x, y - 1, z, chunks) == BlockType::Air {
+                    if self.blocks[x][y - 1][z] == BlockType::Air {
                         add_face(&mut self.vertices, &mut self.indices, world_pos, Face::Bottom);
                     }
-                    if self.get_block(x, y, z + 1, chunks) == BlockType::Air {
+                    if self.blocks[x][y][z + 1] == BlockType::Air {
                         add_face(&mut self.vertices, &mut self.indices, world_pos, Face::Front);
                     }
-                    if self.get_block(x, y, z - 1, chunks) == BlockType::Air {
+                    if self.blocks[x][y][z - 1] == BlockType::Air {
                         add_face(&mut self.vertices, &mut self.indices, world_pos, Face::Back);
                     }
                 }
@@ -259,8 +267,8 @@ pub struct State {
     rx_response: Receiver<ChunkResponse>,
     pending_chunks: HashSet<glam::IVec3>,
 
-    super_vertex_buffer: Option<wgpu::Buffer>,
-    super_index_buffer: Option<wgpu::Buffer>,
+    super_vertex_buffer: wgpu::Buffer,
+    super_index_buffer: wgpu::Buffer,
     super_num_indices: u32,
 
     depth_texture: wgpu::Texture,
@@ -280,6 +288,7 @@ pub struct State {
     mouse_grabbed: bool,
     held_keys: HashSet<KeyCode>,
     last_frame: Instant,
+    start_time: Instant,
 
     // Background color
     clear_color: wgpu::Color
@@ -317,10 +326,45 @@ impl State {
                 &wgpu::DeviceDescriptor {
                     label: Some("main device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
+                    required_limits: wgpu::Limits {
+                        max_buffer_size: adapter.limits().max_buffer_size,
+                        max_bind_groups: adapter.limits().max_bind_groups,
+                        max_color_attachments: adapter.limits().max_color_attachments,
+                        max_color_attachment_bytes_per_sample: adapter.limits().max_color_attachment_bytes_per_sample,
+                        max_bindings_per_bind_group: adapter.limits().max_bindings_per_bind_group,
+                        max_compute_invocations_per_workgroup: adapter.limits().max_compute_invocations_per_workgroup,
+                        max_compute_workgroup_size_x: adapter.limits().max_compute_workgroup_size_x,
+                        max_compute_workgroup_size_y: adapter.limits().max_compute_workgroup_size_y,
+                        max_compute_workgroup_size_z: adapter.limits().max_compute_workgroup_size_z,
+                        max_compute_workgroups_per_dimension: adapter.limits().max_compute_workgroups_per_dimension,
+                        max_compute_workgroup_storage_size: adapter.limits().max_compute_workgroup_storage_size,
+                        max_inter_stage_shader_components: adapter.limits().max_inter_stage_shader_components,
+                        max_dynamic_uniform_buffers_per_pipeline_layout: adapter.limits().max_dynamic_uniform_buffers_per_pipeline_layout,
+                        max_non_sampler_bindings: adapter.limits().max_non_sampler_bindings,
+                        max_push_constant_size: adapter.limits().max_push_constant_size,
+                        max_sampled_textures_per_shader_stage: adapter.limits().max_sampled_textures_per_shader_stage,
+                        max_samplers_per_shader_stage: adapter.limits().max_samplers_per_shader_stage,
+                        max_storage_buffers_per_shader_stage: adapter.limits().max_storage_buffers_per_shader_stage,
+                        max_storage_textures_per_shader_stage: adapter.limits().max_storage_textures_per_shader_stage,
+                        max_subgroup_size: adapter.limits().max_subgroup_size,
+                        max_texture_array_layers: adapter.limits().max_texture_array_layers,
+                        max_texture_dimension_1d: adapter.limits().max_texture_dimension_1d,
+                        max_texture_dimension_2d: adapter.limits().max_texture_dimension_2d,
+                        max_texture_dimension_3d: adapter.limits().max_texture_dimension_3d,
+                        max_uniform_buffer_binding_size: adapter.limits().max_uniform_buffer_binding_size,
+                        max_uniform_buffers_per_shader_stage: adapter.limits().max_uniform_buffers_per_shader_stage,
+                        max_vertex_attributes: adapter.limits().max_vertex_attributes,
+                        max_vertex_buffer_array_stride: adapter.limits().max_vertex_buffer_array_stride,
+                        max_vertex_buffers: adapter.limits().max_vertex_buffers,
+                        min_storage_buffer_offset_alignment: adapter.limits().min_storage_buffer_offset_alignment,
+                        min_subgroup_size: adapter.limits().min_subgroup_size,
+                        min_uniform_buffer_offset_alignment: adapter.limits().min_uniform_buffer_offset_alignment,
+                        max_dynamic_storage_buffers_per_pipeline_layout: adapter.limits().max_dynamic_storage_buffers_per_pipeline_layout,
+                        max_storage_buffer_binding_size: adapter.limits().max_storage_buffer_binding_size
+                    },
                     memory_hints: Default::default(),
                 },
-                None,
+                None
             )
             .await
             .expect("failed to create device");
@@ -407,12 +451,31 @@ impl State {
                             let mut chunk = Chunk::new(pos);
                             generation.generate_chunk(&mut chunk);
 
+                            chunk.rebuild_mesh();
+
                             let _ = tx_res.send(ChunkResponse::Loaded(pos, chunk));
                         }
                     }
                 }
             });
         }
+
+        // Super buffers
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Super Vertex Buffer"),
+            size: (MAX_CHUNKS * EST_VERTS_PER_CHUNK * std::mem::size_of::<Vertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Super Index Buffer"),
+            size: (MAX_CHUNKS * EST_INDICES_PER_CHUNK * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::INDEX
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         // Pipeline layout
         let render_pipeline_layout =
@@ -491,8 +554,8 @@ impl State {
             rx_response,
             pending_chunks: HashSet::new(),
 
-            super_vertex_buffer: None,
-            super_index_buffer: None,
+            super_vertex_buffer: vertex_buffer,
+            super_index_buffer: index_buffer,
             super_num_indices: 0,
 
             depth_texture,
@@ -511,6 +574,7 @@ impl State {
             mouse_grabbed: false,
             held_keys: HashSet::new(),
             last_frame: Instant::now(),
+            start_time: Instant::now(),
 
             clear_color: wgpu::Color {
                 r: 0.05,
@@ -605,6 +669,7 @@ impl State {
         window.set_cursor_visible(!grabbed);
     }
 
+    // Chunk updater
     pub fn update_chunks(&mut self) {
         let cam_chunk = glam::IVec3::new(
             (self.camera_pos.x / CHUNK_SIZE as f32).floor() as i32,
@@ -612,13 +677,17 @@ impl State {
             (self.camera_pos.z / CHUNK_SIZE as f32).floor() as i32,
         );
 
-        let radius = RENDER_DISTANCE + 1; // Extra one for smoothness
+        let radius = RENDER_DISTANCE;
 
         for x in -radius..=radius {
             for z in -radius..=radius {
-                for y in Y_DIST.x..=Y_DIST.y {
+                for y in -radius..=radius {
                     let pos = cam_chunk + glam::IVec3::new(x, y, z);
-
+                    
+                    if pos.y < Y_DIST.x || pos.y > Y_DIST.y {
+                        continue;
+                    }
+                    
                     if self.chunks.contains_key(&pos) || self.pending_chunks.contains(&pos) {
                         continue;
                     }
@@ -632,25 +701,18 @@ impl State {
         let mut world_mesh_dirty = false;
         while let Ok(response) = self.rx_response.try_recv() {
             match response {
-                ChunkResponse::Loaded(pos, mut chunk) => {
+                ChunkResponse::Loaded(pos, chunk) => {
                     self.pending_chunks.remove(&pos);
 
                     // Rebuild on main thread
-                    chunk.rebuild_mesh(&self.chunks);
                     self.chunks.insert(pos, chunk);
                     world_mesh_dirty = true;
-
-                    for offset in [glam::IVec3::X, glam::IVec3::NEG_X, glam::IVec3::Y, glam::IVec3::NEG_Y, glam::IVec3::Z, glam::IVec3::NEG_Z] {
-                        if let Some(neighbor) = self.chunks.get_mut(&(pos + offset)) {
-                            neighbor.dirty = true;
-                        }
-                    }
                 }
             }
         }
 
         // Hysteresis padding
-        let unload_padding = 1;
+        let unload_padding = 2;
         let max_dist = RENDER_DISTANCE + unload_padding;
 
         let mut chunks_to_remove = Vec::new();
@@ -659,8 +721,7 @@ impl State {
         for &pos in self.chunks.keys() {
             let delta = pos - cam_chunk;
             
-            if delta.x.abs() > max_dist || delta.z.abs() > max_dist || 
-            delta.y < Y_DIST.x - unload_padding || delta.y > Y_DIST.y + unload_padding {
+            if delta.x.abs() > max_dist || delta.z.abs() > max_dist || delta.y.abs() > max_dist {
                 chunks_to_remove.push(pos);
             }
         }
@@ -679,6 +740,20 @@ impl State {
                         neighbor.dirty = true;
                     }
                 }
+            }
+            world_mesh_dirty = true;
+        }
+
+        let dirty_positions: Vec<glam::IVec3> = self.chunks.iter()
+            .filter(|(_, chunk)| chunk.dirty)
+            .map(|(&pos, _)| pos)
+            .collect();
+
+        for pos in dirty_positions {
+            if let Some(mut chunk) = self.chunks.remove(&pos) {
+                chunk.rebuild_mesh();
+                self.chunks.insert(pos, chunk);
+                world_mesh_dirty = true;
             }
         }
 
@@ -702,25 +777,23 @@ impl State {
         }
 
         if master_vertices.is_empty() {
-            self.super_vertex_buffer = None;
-            self.super_index_buffer = None;
             self.super_num_indices = 0;
             return;
         }
 
         self.super_num_indices = master_indices.len() as u32;
 
-        self.super_vertex_buffer = Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Super Mesh Vertex Buffer"),
-            contents: bytemuck::cast_slice(&master_vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        }));
+        self.queue.write_buffer(
+            &self.super_vertex_buffer,
+            0,
+            bytemuck::cast_slice(&master_vertices),
+        );
 
-        self.super_index_buffer = Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Super Mesh Index Buffer"),
-            contents: bytemuck::cast_slice(&master_indices),
-            usage: wgpu::BufferUsages::INDEX,
-        }));
+        self.queue.write_buffer(
+            &self.super_index_buffer,
+            0,
+            bytemuck::cast_slice(&master_indices),
+        );
     }
 
     // Per frame updates
@@ -728,7 +801,7 @@ impl State {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
-
+        let time = self.start_time.elapsed().as_secs_f32();
 
         let speed: f32 = 60.0;
         let friction: f32 = 0.05;
@@ -738,8 +811,10 @@ impl State {
         io::stdout().flush().unwrap();
 
 
-        // Update chunks
-        self.update_chunks();
+        // Update chunks every 0.1 seconds
+        if time % 0.1 < dt {
+            self.update_chunks();
+        }
 
 
         let forward = Vec3::new(
@@ -780,7 +855,7 @@ impl State {
             std::f32::consts::FRAC_PI_4,
             self.config.width as f32 / self.config.height as f32,
             0.1,
-            CHUNK_SIZE as f32 * RENDER_DISTANCE as f32 * 2.0,
+            CHUNK_SIZE as f32 * (RENDER_DISTANCE as f32 + 1.0) * 2.0,
         );
         self.camera_uniform.view_proj = (proj * view).to_cols_array_2d();
 
@@ -833,9 +908,9 @@ impl State {
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
 
-            if let (Some(vb), Some(ib)) = (&self.super_vertex_buffer, &self.super_index_buffer) {
-                render_pass.set_vertex_buffer(0, vb.slice(..));
-                render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+            if self.super_num_indices > 0 {
+                render_pass.set_vertex_buffer(0, self.super_vertex_buffer.slice(..));
+                render_pass.set_index_buffer(self.super_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.draw_indexed(0..self.super_num_indices, 0, 0..1);
             }
         }

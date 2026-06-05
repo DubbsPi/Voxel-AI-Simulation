@@ -72,18 +72,18 @@ impl WorldGen {
         let cy = chunk.position.y * crate::state::CHUNK_SIZE;
         let cz = chunk.position.z * crate::state::CHUNK_SIZE;
 
-        for x in 0..crate::state::CHUNK_SIZE {
-            for z in 0..crate::state::CHUNK_SIZE {
-                let world_x = cx + x as i32;
-                let world_z = cz + z as i32;
+        for x in 0..crate::state::PADDED_SIZE {
+            for z in 0..crate::state::PADDED_SIZE {
+                let world_x = cx + x as i32 - 1;
+                let world_z = cz + z as i32 - 1;
                 let surface = self.surface_height(world_x, world_z);
 
-                for y in 0..crate::state::CHUNK_SIZE {
-                    let world_y = cy + y as i32;
+                for y in 0..crate::state::PADDED_SIZE {
+                    let world_y = cy + y as i32 - 1;
 
                     let block = if world_y > surface {
                         BlockType::Air
-                    } else if self.is_cave(world_x, world_y, world_z) && world_y < surface - 1 && world_y >2 {
+                    } else if self.is_cave(world_x, world_y, world_z) {
                         BlockType::Air 
                     } else {
                         BlockType::Solid
