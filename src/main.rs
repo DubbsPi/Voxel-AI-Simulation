@@ -10,6 +10,8 @@ use winit::{
 mod state;
 use state::State;
 
+pub mod worldgen;
+
 use rand::Rng;
 
 

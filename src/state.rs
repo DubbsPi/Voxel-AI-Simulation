@@ -1,15 +1,27 @@
 use glam::{
-    Vec3,
-    Mat4
+    IVec2, Mat4, Vec3
 };
 use std::{
     sync::Arc,
-    time::Instant
+    time::Instant,
+    io::{self, Write},
+    thread
 };
+use crossbeam_channel::{unbounded, Sender, Receiver};
 use wgpu::util::DeviceExt;
 use winit::keyboard::KeyCode;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use winit::{dpi::PhysicalSize, window::Window};
+
+use crate::worldgen;
+use worldgen::{BlockType, WorldGen};
+
+
+pub const CHUNK_SIZE: i32 = 32;
+pub const RENDER_DISTANCE: i32 = 2;
+pub const Y_DIST: IVec2 = IVec2::new(-2, 4);
+pub const WORLD_SEED: i32 = 1337;
+pub const CHUNK_THREADS: i16 = 8;
 
 
 // Vertex uniform
@@ -37,15 +49,14 @@ impl Vertex {
                 },
                 // location 1 = normal
                 wgpu::VertexAttribute {
-                    // Offset sits after position and color arrays
-                    offset: (std::mem::size_of::<[f32; 3]>() * 2) as wgpu::BufferAddress,
-                    shader_location: 2,
+                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    shader_location: 1,
                     format: wgpu::VertexFormat::Float32x3,
                 },
                 // location 2 = color
                 wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
-                    shader_location: 1,
+                    offset: (std::mem::size_of::<[f32; 3]>() * 2) as wgpu::BufferAddress,
+                    shader_location: 2,
                     format: wgpu::VertexFormat::Float32x3,
                 }
             ]
@@ -71,38 +82,27 @@ impl CameraUniform {
 
 
 // Chunk uniform
-#[derive(Copy)]
-#[derive(Clone)]
-#[derive(PartialEq)]
-pub enum BlockType {
-    Air,
-    Solid,
-    // add more as needed
-}
-
 pub struct Chunk {
-    pub blocks: Box<[[[BlockType; 16]; 16]; 16]>,
+    pub blocks: Box<[[[BlockType; CHUNK_SIZE as usize]; CHUNK_SIZE as usize]; CHUNK_SIZE as usize]>,
 
     // In chunk coords
     pub position: glam::IVec3,
 
     // GPU buffers
-    vertex_buffer: Option<wgpu::Buffer>,
-    index_buffer: Option<wgpu::Buffer>,
-    num_indices: u32,
+    pub vertices: Vec<Vertex>,
+    pub indices: Vec<u32>,
 
-    pub dirty: bool,
+    pub dirty: bool
 }
 
 impl Chunk {
     pub fn new(position: glam::IVec3) -> Self {
         Self {
-            blocks: Box::new([[[BlockType::Air; 16]; 16]; 16]),
+            blocks: Box::new([[[BlockType::Air; CHUNK_SIZE as usize]; CHUNK_SIZE as usize]; CHUNK_SIZE as usize]),
             position,
-            vertex_buffer: None,
-            index_buffer: None,
-            num_indices: 0,
-            dirty: true,
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            dirty: true
         }
     }
 
@@ -111,85 +111,83 @@ impl Chunk {
         self.dirty = true;
     }
 
-    fn get_block_local(&self, x: i32, y: i32, z: i32) -> BlockType {
-        if x < 0 || y < 0 || z < 0 || x >= 16 || y >= 16 || z >= 16 {
-            return BlockType::Air;
+    fn get_block(&self, x: i32, y: i32, z: i32, chunks: &HashMap<glam::IVec3, Chunk>) -> BlockType {
+        if x >= 0 && x < CHUNK_SIZE && y >= 0 && y < CHUNK_SIZE && z >= 0 && z < CHUNK_SIZE {
+            return self.blocks[x as usize][y as usize][z as usize];
         }
-        self.blocks[x as usize][y as usize][z as usize]
+
+        let mut target_chunk = self.position;
+        let mut lx = x;
+        let mut ly = y;
+        let mut lz = z;
+
+        if lx < 0 { target_chunk.x -= 1; lx += CHUNK_SIZE; }
+        else if lx >= CHUNK_SIZE { target_chunk.x += 1; lx -= CHUNK_SIZE; }
+
+        if ly < 0 { target_chunk.y -= 1; ly += CHUNK_SIZE; }
+        else if ly >= CHUNK_SIZE { target_chunk.y += 1; ly -= CHUNK_SIZE; }
+
+        if lz < 0 { target_chunk.z -= 1; lz += CHUNK_SIZE; }
+        else if lz >= CHUNK_SIZE { target_chunk.z += 1; lz -= CHUNK_SIZE; }
+
+        if let Some(neighbor) = chunks.get(&target_chunk) {
+            neighbor.blocks[lx as usize][ly as usize][lz as usize]
+        } else {
+            BlockType::Air
+        }
     }
 
-    pub fn rebuild_mesh(&mut self, device: &wgpu::Device) {
-        let mut vertices: Vec<Vertex> = Vec::new();
-        let mut indices: Vec<u16> = Vec::new();
+    pub fn rebuild_mesh(&mut self, chunks: &HashMap<glam::IVec3, Chunk>) {
+        self.vertices.clear();
+        self.indices.clear();
 
         let chunk_world = glam::Vec3::new(
-            (self.position.x * 16) as f32,
-            (self.position.y * 16) as f32,
-            (self.position.z * 16) as f32,
+            (self.position.x * CHUNK_SIZE) as f32,
+            (self.position.y * CHUNK_SIZE) as f32,
+            (self.position.z * CHUNK_SIZE) as f32,
         );
 
-        for x in 0..16i32 {
-            for y in 0..16i32 {
-                for z in 0..16i32 {
+        for x in 0..CHUNK_SIZE {
+            for y in 0..CHUNK_SIZE {
+                for z in 0..CHUNK_SIZE {
                     if self.blocks[x as usize][y as usize][z as usize] == BlockType::Air {
                         continue;
                     }
 
                     let world_pos = chunk_world + glam::Vec3::new(x as f32, y as f32, z as f32);
 
-                    if self.get_block_local(x + 1, y, z) == BlockType::Air {
-                        add_face(&mut vertices, &mut indices, world_pos, Face::Right);
+                    if self.get_block(x + 1, y, z, chunks) == BlockType::Air {
+                        add_face(&mut self.vertices, &mut self.indices, world_pos, Face::Right);
                     }
-                    if self.get_block_local(x - 1, y, z) == BlockType::Air {
-                        add_face(&mut vertices, &mut indices, world_pos, Face::Left);
+                    if self.get_block(x - 1, y, z, chunks) == BlockType::Air {
+                        add_face(&mut self.vertices, &mut self.indices, world_pos, Face::Left);
                     }
-                    if self.get_block_local(x, y + 1, z) == BlockType::Air {
-                        add_face(&mut vertices, &mut indices, world_pos, Face::Top);
+                    if self.get_block(x, y + 1, z, chunks) == BlockType::Air {
+                        add_face(&mut self.vertices, &mut self.indices, world_pos, Face::Top);
                     }
-                    if self.get_block_local(x, y - 1, z) == BlockType::Air {
-                        add_face(&mut vertices, &mut indices, world_pos, Face::Bottom);
+                    if self.get_block(x, y - 1, z, chunks) == BlockType::Air {
+                        add_face(&mut self.vertices, &mut self.indices, world_pos, Face::Bottom);
                     }
-                    if self.get_block_local(x, y, z + 1) == BlockType::Air {
-                        add_face(&mut vertices, &mut indices, world_pos, Face::Front);
+                    if self.get_block(x, y, z + 1, chunks) == BlockType::Air {
+                        add_face(&mut self.vertices, &mut self.indices, world_pos, Face::Front);
                     }
-                    if self.get_block_local(x, y, z - 1) == BlockType::Air {
-                        add_face(&mut vertices, &mut indices, world_pos, Face::Back);
+                    if self.get_block(x, y, z - 1, chunks) == BlockType::Air {
+                        add_face(&mut self.vertices, &mut self.indices, world_pos, Face::Back);
                     }
                 }
             }
         }
 
-        if vertices.is_empty() {
-            // All air
-            self.vertex_buffer = None;
-            self.index_buffer = None;
-            self.num_indices = 0;
-            self.dirty = false;
-            return;
-        }
-
-        self.num_indices = indices.len() as u32;
-
-        self.vertex_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(&format!("chunk {:?} vertex buffer", self.position)),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX
-        }));
-        self.index_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(&format!("chunk {:?} index buffer", self.position)),
-            contents: bytemuck::cast_slice(&indices),
-            usage: wgpu::BufferUsages::INDEX
-        }));
-
         self.dirty = false;
     }
 }
 
+
 #[derive(Clone, Copy)]
 enum Face { Top, Bottom, Left, Right, Front, Back }
 
-fn add_face(vertices: &mut Vec<Vertex>, indices: &mut Vec<u16>, pos: glam::Vec3, face: Face) {
-    let base = vertices.len() as u16;
+fn add_face(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, pos: glam::Vec3, face: Face) {
+    let base = vertices.len() as u32;
 
     let (corners, normal, color) = match face {
         Face::Top => (
@@ -233,6 +231,15 @@ fn add_face(vertices: &mut Vec<Vertex>, indices: &mut Vec<u16>, pos: glam::Vec3,
 }
 
 
+// Threading for chunk generation
+pub enum ChunkRequest {
+    Load(glam::IVec3)
+}
+pub enum ChunkResponse {
+    Loaded(glam::IVec3, Chunk)
+}
+
+
 // States of the engine
 pub struct State {
     // Core objects
@@ -245,7 +252,16 @@ pub struct State {
     // Rendering
     render_pipeline: wgpu::RenderPipeline,
     
-    chunks: Vec<Chunk>,
+    // World generation and chunks
+    chunks: HashMap<glam::IVec3, Chunk>,
+
+    tx_request: Sender<ChunkRequest>,
+    rx_response: Receiver<ChunkResponse>,
+    pending_chunks: HashSet<glam::IVec3>,
+
+    super_vertex_buffer: Option<wgpu::Buffer>,
+    super_index_buffer: Option<wgpu::Buffer>,
+    super_num_indices: u32,
 
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
@@ -266,7 +282,7 @@ pub struct State {
     last_frame: Instant,
 
     // Background color
-    clear_color: wgpu::Color,
+    clear_color: wgpu::Color
 }
 
 impl State {
@@ -326,7 +342,7 @@ impl State {
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode: wgpu::PresentMode::AutoNoVsync,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -372,6 +388,31 @@ impl State {
             }],
         });
 
+        
+        // Threading setup
+        let (tx_request, rx_request) = unbounded::<ChunkRequest>();
+        let (tx_response, rx_response) = unbounded::<ChunkResponse>();
+
+        let world_gen_arc = Arc::new(WorldGen::new(WORLD_SEED));
+
+        for _ in 0..CHUNK_THREADS {
+            let rx_req = rx_request.clone();
+            let tx_res = tx_response.clone();
+            let generation = Arc::clone(&world_gen_arc);
+
+            thread::spawn(move || {
+                while let Ok(request) = rx_req.recv() {
+                    match request {
+                        ChunkRequest::Load(pos) => {
+                            let mut chunk = Chunk::new(pos);
+                            generation.generate_chunk(&mut chunk);
+
+                            let _ = tx_res.send(ChunkResponse::Loaded(pos, chunk));
+                        }
+                    }
+                }
+            });
+        }
 
         // Pipeline layout
         let render_pipeline_layout =
@@ -425,22 +466,15 @@ impl State {
             multiview: None,
             cache: None,
         });
-
         
-        // Buffers
-        let mut chunks: Vec<Chunk> = Vec::new();
 
-        let mut chunk = Chunk::new(glam::IVec3::new(0, -1, -1));
-        for x in 0..16 {
-            for z in 0..16 {
-                let xf = x as f32;
-                let zf = z as f32;
-                chunk.set_block(x, ((xf + zf * 0.5).sin() * 3.0 + 10.0) as usize, z, BlockType::Solid);
-            }
-        }
-        chunk.rebuild_mesh(&device);
-        chunks.push(chunk);
+        // Chunks
+        let chunks = HashMap::new();
 
+        let world_gen = WorldGen::new(WORLD_SEED);
+        let y_pos = world_gen.surface_height(0, 0) as f32 + 2.0;
+
+        // Depth texture
         let (depth_texture, depth_view, sampler) = Self::create_depth_texture(&device, &config);
                 
         Self {
@@ -453,6 +487,14 @@ impl State {
 
             chunks,
 
+            tx_request,
+            rx_response,
+            pending_chunks: HashSet::new(),
+
+            super_vertex_buffer: None,
+            super_index_buffer: None,
+            super_num_indices: 0,
+
             depth_texture,
             depth_view,
             sampler,
@@ -461,7 +503,7 @@ impl State {
             camera_uniform,
             camera_bind_group,
 
-            camera_pos: Vec3::new(0.0, 0.0, 2.0),
+            camera_pos: Vec3::new(0.0, y_pos, 0.0),
             camera_yaw: -std::f32::consts::FRAC_PI_2,
             camera_pitch: 0.0,
             camera_v: Vec3::new(0.0, 0.0, 0.0),
@@ -475,7 +517,7 @@ impl State {
                 g: 0.05,
                 b: 0.08,
                 a: 1.0,
-            },
+            }
         }
     }
 
@@ -512,22 +554,6 @@ impl State {
         });
 
         (texture, view, sampler)
-    }
-
-    fn create_vertex_buffer(device: &wgpu::Device, vertices: &[Vertex]) -> wgpu::Buffer {
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("vertex buffer"),
-            contents: bytemuck::cast_slice(vertices),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        })
-    }
-
-    fn create_index_buffer(device: &wgpu::Device, indices: &[u16]) -> wgpu::Buffer {
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("index buffer"),
-            contents: bytemuck::cast_slice(indices),
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-        })
     }
 
     pub fn size(&self) -> PhysicalSize<u32> {
@@ -579,6 +605,124 @@ impl State {
         window.set_cursor_visible(!grabbed);
     }
 
+    pub fn update_chunks(&mut self) {
+        let cam_chunk = glam::IVec3::new(
+            (self.camera_pos.x / CHUNK_SIZE as f32).floor() as i32,
+            (self.camera_pos.y / CHUNK_SIZE as f32).floor() as i32,
+            (self.camera_pos.z / CHUNK_SIZE as f32).floor() as i32,
+        );
+
+        let radius = RENDER_DISTANCE + 1; // Extra one for smoothness
+
+        for x in -radius..=radius {
+            for z in -radius..=radius {
+                for y in Y_DIST.x..=Y_DIST.y {
+                    let pos = cam_chunk + glam::IVec3::new(x, y, z);
+
+                    if self.chunks.contains_key(&pos) || self.pending_chunks.contains(&pos) {
+                        continue;
+                    }
+
+                    self.pending_chunks.insert(pos);
+                    let _ = self.tx_request.send(ChunkRequest::Load(pos));
+                }
+            }
+        }
+
+        let mut world_mesh_dirty = false;
+        while let Ok(response) = self.rx_response.try_recv() {
+            match response {
+                ChunkResponse::Loaded(pos, mut chunk) => {
+                    self.pending_chunks.remove(&pos);
+
+                    // Rebuild on main thread
+                    chunk.rebuild_mesh(&self.chunks);
+                    self.chunks.insert(pos, chunk);
+                    world_mesh_dirty = true;
+
+                    for offset in [glam::IVec3::X, glam::IVec3::NEG_X, glam::IVec3::Y, glam::IVec3::NEG_Y, glam::IVec3::Z, glam::IVec3::NEG_Z] {
+                        if let Some(neighbor) = self.chunks.get_mut(&(pos + offset)) {
+                            neighbor.dirty = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Hysteresis padding
+        let unload_padding = 1;
+        let max_dist = RENDER_DISTANCE + unload_padding;
+
+        let mut chunks_to_remove = Vec::new();
+
+        // Identify chunks outside view distance
+        for &pos in self.chunks.keys() {
+            let delta = pos - cam_chunk;
+            
+            if delta.x.abs() > max_dist || delta.z.abs() > max_dist || 
+            delta.y < Y_DIST.x - unload_padding || delta.y > Y_DIST.y + unload_padding {
+                chunks_to_remove.push(pos);
+            }
+        }
+
+        if !chunks_to_remove.is_empty() {
+            for pos in chunks_to_remove {
+                self.chunks.remove(&pos);
+                self.pending_chunks.remove(&pos);
+
+                for offset in [
+                    glam::IVec3::X, glam::IVec3::NEG_X,
+                    glam::IVec3::Y, glam::IVec3::NEG_Y,
+                    glam::IVec3::Z, glam::IVec3::NEG_Z,
+                ] {
+                    if let Some(neighbor) = self.chunks.get_mut(&(pos + offset)) {
+                        neighbor.dirty = true;
+                    }
+                }
+            }
+        }
+
+        if world_mesh_dirty {
+            self.rebuild_super_mesh();
+        }
+    }
+
+    // Chunk updates
+    fn rebuild_super_mesh(&mut self) {
+        let mut master_vertices: Vec<Vertex> = Vec::new();
+        let mut master_indices: Vec<u32> = Vec::new();
+
+        for chunk in self.chunks.values() {
+            let vertex_offset = master_vertices.len() as u32;
+            master_vertices.extend_from_slice(&chunk.vertices);
+            
+            for &idx in &chunk.indices {
+                master_indices.push(idx + vertex_offset);
+            }
+        }
+
+        if master_vertices.is_empty() {
+            self.super_vertex_buffer = None;
+            self.super_index_buffer = None;
+            self.super_num_indices = 0;
+            return;
+        }
+
+        self.super_num_indices = master_indices.len() as u32;
+
+        self.super_vertex_buffer = Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Super Mesh Vertex Buffer"),
+            contents: bytemuck::cast_slice(&master_vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        }));
+
+        self.super_index_buffer = Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Super Mesh Index Buffer"),
+            contents: bytemuck::cast_slice(&master_indices),
+            usage: wgpu::BufferUsages::INDEX,
+        }));
+    }
+
     // Per frame updates
     pub fn update(&mut self) {
         let now = Instant::now();
@@ -586,8 +730,16 @@ impl State {
         self.last_frame = now;
 
 
-        let speed: f32 = 15.0;
+        let speed: f32 = 60.0;
         let friction: f32 = 0.05;
+
+        let fps = 1.0 / dt;
+        print!("\rFPS: {:.0}", fps);
+        io::stdout().flush().unwrap();
+
+
+        // Update chunks
+        self.update_chunks();
 
 
         let forward = Vec3::new(
@@ -628,7 +780,7 @@ impl State {
             std::f32::consts::FRAC_PI_4,
             self.config.width as f32 / self.config.height as f32,
             0.1,
-            100.0,
+            CHUNK_SIZE as f32 * RENDER_DISTANCE as f32 * 2.0,
         );
         self.camera_uniform.view_proj = (proj * view).to_cols_array_2d();
 
@@ -638,15 +790,8 @@ impl State {
             0,
             bytemuck::cast_slice(&[self.camera_uniform]),
         );
-
-        // Chunk rebuilds
-        for chunk in &mut self.chunks {
-            if chunk.dirty {
-                chunk.rebuild_mesh(&self.device);
-            }
-        }
     }
-
+    
     // Render a frame
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
@@ -686,15 +831,12 @@ impl State {
             });
             
             render_pass.set_pipeline(&self.render_pipeline);
-            
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
 
-            for chunk in &self.chunks {
-                if let (Some(vb), Some(ib)) = (&chunk.vertex_buffer, &chunk.index_buffer) {
-                    render_pass.set_vertex_buffer(0, vb.slice(..));
-                    render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint16);
-                    render_pass.draw_indexed(0..chunk.num_indices, 0, 0..1);
-                }
+            if let (Some(vb), Some(ib)) = (&self.super_vertex_buffer, &self.super_index_buffer) {
+                render_pass.set_vertex_buffer(0, vb.slice(..));
+                render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..self.super_num_indices, 0, 0..1);
             }
         }
 
